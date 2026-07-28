@@ -1,264 +1,272 @@
-/*
-===========================================================
-Modular Battery Management System (BMS)
-ESP32
-===========================================================
+#define NUM_CELLS 16      // Change only this to 8 or 16
 
-Features
---------
-✓ Number of cells changed using one constant
-✓ Read all battery cell voltages
-✓ Calculate State of Charge (SoC)
-✓ Find weakest cell
-✓ Find strongest cell
-✓ Calculate voltage imbalance
-✓ Detect increasing/decreasing imbalance
-✓ Adaptive imbalance threshold based on SoC
-✓ Clean interface using BatteryPack structure
-✓ Easy to expand from 4 cells to 16 cells
+// ADC pins for ESP32
+const int adcPins[NUM_CELLS] = {36, 39, 34, 35};
 
-===========================================================
-*/
+// Battery limits
+const float MIN_CELL_VOLTAGE = 3.0;
+const float MAX_CELL_VOLTAGE = 4.2;
 
-#define NUM_CELLS 4          // Change only this value to 16 if required
+// Trend Type
 
-// ADC Pins
-int cellPins[NUM_CELLS] = {36,39,34,35};
-
-//-------------------------------
-// Structure for one battery cell
-//-------------------------------
-struct Cell
+enum TrendType
 {
-  float voltage;
-  int soc;
+  TREND_INCREASING,
+  TREND_DECREASING,
+  TREND_STABLE
 };
 
-//--------------------------------
-// Structure for complete battery
-//--------------------------------
-struct BatteryPack
+
+// Battery Information Structure
+struct BatteryInfo
 {
-  Cell cell[NUM_CELLS];
+  float voltage[NUM_CELLS];
 
   int weakestCell;
   int strongestCell;
 
-  float weakestVoltage;
-  float strongestVoltage;
+  float lowestVoltage;
+  float highestVoltage;
 
   float imbalance;
 
   float previousImbalance;
 
-  bool imbalanceIncreasing;
+  TrendType trend;
 
-  float warningThreshold;
-  float faultThreshold;
+  float soc;
 
-} pack;
+  float threshold;
 
-//=========================================================
-// Convert Voltage to SoC
-//=========================================================
-int calculateSOC(float voltage)
-{
-  if(voltage >= 4.2)
-    return 100;
+  bool imbalanceFault;
+};
 
-  if(voltage <= 3.0)
-    return 0;
+BatteryInfo battery;
 
-  return ((voltage-3.0)/1.2)*100;
-}
+// Function Prototypes
+void readVoltages();
+void analyzeCells();
+void calculateSOC();
+void calculateAdaptiveThreshold();
+void detectTrend();
+void printBatteryInfo();
 
-//=========================================================
-// Read Battery Cells
-//=========================================================
-void readCells()
-{
-  for(int i=0;i<NUM_CELLS;i++)
-  {
-    int adc = analogRead(cellPins[i]);
-
-    // Convert ADC to Voltage (Approximation)
-
-    pack.cell[i].voltage =
-    3.0 + ((float)adc/4095.0)*1.2;
-
-    pack.cell[i].soc =
-    calculateSOC(pack.cell[i].voltage);
-  }
-}
-
-//=========================================================
-// Analyse Battery Pack
-//=========================================================
-void analyseBattery()
-{
-  pack.weakestCell=0;
-  pack.strongestCell=0;
-
-  for(int i=1;i<NUM_CELLS;i++)
-  {
-    if(pack.cell[i].voltage <
-       pack.cell[pack.weakestCell].voltage)
-
-       pack.weakestCell=i;
-
-    if(pack.cell[i].voltage >
-       pack.cell[pack.strongestCell].voltage)
-
-       pack.strongestCell=i;
-  }
-
-  pack.weakestVoltage =
-  pack.cell[pack.weakestCell].voltage;
-
-  pack.strongestVoltage =
-  pack.cell[pack.strongestCell].voltage;
-
-  pack.imbalance =
-  pack.strongestVoltage-pack.weakestVoltage;
-
-  //------------------------------
-  // Increasing or Decreasing
-  //------------------------------
-
-  if(pack.imbalance >
-     pack.previousImbalance)
-
-      pack.imbalanceIncreasing=true;
-
-  else
-
-      pack.imbalanceIncreasing=false;
-
-  pack.previousImbalance=
-  pack.imbalance;
-}
-
-//=========================================================
-// Adaptive Threshold
-//=========================================================
-void adaptiveThreshold()
-{
-  int totalSOC=0;
-
-  for(int i=0;i<NUM_CELLS;i++)
-      totalSOC+=pack.cell[i].soc;
-
-  int averageSOC=totalSOC/NUM_CELLS;
-
-  // High SoC -> Larger Threshold
-
-  if(averageSOC>=80)
-  {
-      pack.warningThreshold=0.10;
-      pack.faultThreshold=0.20;
-  }
-
-  // Medium SoC
-
-  else if(averageSOC>=40)
-  {
-      pack.warningThreshold=0.08;
-      pack.faultThreshold=0.15;
-  }
-
-  // Low SoC -> Smaller Threshold
-
-  else
-  {
-      pack.warningThreshold=0.05;
-      pack.faultThreshold=0.10;
-  }
-}
-
-//=========================================================
-// Display Battery Information
-//=========================================================
-void displayBattery()
-{
-  Serial.println("--------------------------------");
-
-  for(int i=0;i<NUM_CELLS;i++)
-  {
-    Serial.print("Cell ");
-    Serial.print(i+1);
-
-    Serial.print(" Voltage = ");
-
-    Serial.print(pack.cell[i].voltage);
-
-    Serial.print(" V");
-
-    Serial.print("   SoC = ");
-
-    Serial.print(pack.cell[i].soc);
-
-    Serial.println("%");
-  }
-
-  Serial.println();
-
-  Serial.print("Weakest Cell : ");
-  Serial.println(pack.weakestCell+1);
-
-  Serial.print("Strongest Cell : ");
-  Serial.println(pack.strongestCell+1);
-
-  Serial.print("Imbalance : ");
-  Serial.print(pack.imbalance);
-  Serial.println(" V");
-
-  if(pack.imbalanceIncreasing)
-      Serial.println("Imbalance Increasing");
-
-  else
-      Serial.println("Imbalance Decreasing");
-
-  Serial.print("Warning Threshold : ");
-  Serial.println(pack.warningThreshold);
-
-  Serial.print("Fault Threshold : ");
-  Serial.println(pack.faultThreshold);
-
-  if(pack.imbalance>=pack.faultThreshold)
-      Serial.println("FAULT");
-
-  else if(pack.imbalance>=pack.warningThreshold)
-      Serial.println("WARNING");
-
-  else
-      Serial.println("Battery Healthy");
-
-  Serial.println("--------------------------------");
-}
-
-//=========================================================
-// Setup
-//=========================================================
 void setup()
 {
   Serial.begin(115200);
 
-  for(int i=0;i<NUM_CELLS;i++)
-      pinMode(cellPins[i],INPUT);
+  analogReadResolution(12);
+
+  battery.previousImbalance = 0;
+
+  Serial.println("\n========== Modular BMS ==========");
 }
 
-//=========================================================
-// Loop
-//=========================================================
 void loop()
 {
-  readCells();
+  readVoltages();
 
-  analyseBattery();
+  analyzeCells();
 
-  adaptiveThreshold();
+  calculateSOC();
 
-  displayBattery();
+  calculateAdaptiveThreshold();
 
-  delay(1000);
+  detectTrend();
+
+  printBatteryInfo();
+
+  delay(2000);
+}
+
+// Read Cell Voltages
+
+void readVoltages()
+{
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    int adc = analogRead(adcPins[i]);
+
+    battery.voltage[i] =
+      MIN_CELL_VOLTAGE +
+      ((float)adc / 4095.0) *
+      (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE);
+  }
+}
+
+// Analyze Cells
+
+void analyzeCells()
+{
+  battery.lowestVoltage = battery.voltage[0];
+  battery.highestVoltage = battery.voltage[0];
+
+  battery.weakestCell = 0;
+  battery.strongestCell = 0;
+
+  for (int i = 1; i < NUM_CELLS; i++)
+  {
+    if (battery.voltage[i] < battery.lowestVoltage)
+    {
+      battery.lowestVoltage = battery.voltage[i];
+      battery.weakestCell = i;
+    }
+
+    if (battery.voltage[i] > battery.highestVoltage)
+    {
+      battery.highestVoltage = battery.voltage[i];
+      battery.strongestCell = i;
+    }
+  }
+
+  battery.imbalance =
+      battery.highestVoltage -
+      battery.lowestVoltage;
+}
+
+// Simple SoC Estimation
+
+void calculateSOC()
+{
+  float average = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++)
+    average += battery.voltage[i];
+
+  average /= NUM_CELLS;
+
+  battery.soc =
+      ((average - MIN_CELL_VOLTAGE) /
+      (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE))
+      * 100.0;
+
+  battery.soc = constrain(battery.soc, 0, 100);
+}
+
+
+// Adaptive Threshold
+
+void calculateAdaptiveThreshold()
+{
+  if (battery.soc > 80)
+      battery.threshold = 0.05;
+
+  else if (battery.soc > 50)
+      battery.threshold = 0.08;
+
+  else if (battery.soc > 20)
+      battery.threshold = 0.12;
+
+  else
+      battery.threshold = 0.18;
+
+  battery.imbalanceFault =
+      battery.imbalance >
+      battery.threshold;
+}
+
+
+// Trend Detection
+
+
+void detectTrend()
+{
+  float tolerance = 0.003;
+
+  if (battery.imbalance >
+      battery.previousImbalance + tolerance)
+  {
+    battery.trend = TREND_INCREASING;
+  }
+  else if (battery.imbalance <
+           battery.previousImbalance - tolerance)
+  {
+    battery.trend = TREND_DECREASING;
+  }
+  else
+  {
+    battery.trend = TREND_STABLE;
+  }
+
+  battery.previousImbalance =
+      battery.imbalance;
+}
+
+// Display Results
+
+void printBatteryInfo()
+{
+  Serial.println();
+  Serial.println("===================================");
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    Serial.print("Cell ");
+    Serial.print(i + 1);
+    Serial.print(" : ");
+    Serial.print(battery.voltage[i], 3);
+    Serial.println(" V");
+  }
+
+  Serial.println("-----------------------------------");
+
+  Serial.print("Weakest Cell : ");
+  Serial.println(battery.weakestCell + 1);
+
+  Serial.print("Strongest Cell : ");
+  Serial.println(battery.strongestCell + 1);
+
+  Serial.print("Lowest Voltage : ");
+  Serial.print(battery.lowestVoltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Highest Voltage : ");
+  Serial.print(battery.highestVoltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Imbalance : ");
+  Serial.print(battery.imbalance, 3);
+  Serial.println(" V");
+
+  Serial.print("SoC : ");
+  Serial.print(battery.soc, 1);
+  Serial.println(" %");
+
+  Serial.print("Adaptive Threshold : ");
+  Serial.print(battery.threshold, 3);
+  Serial.println(" V");
+
+  Serial.print("Trend : ");
+
+  switch (battery.trend)
+  {
+    case TREND_INCREASING:
+      Serial.println("Increasing");
+      break;
+
+    case TREND_DECREASING:
+      Serial.println("Decreasing");
+      break;
+
+    case TREND_STABLE:
+      Serial.println("Stable");
+      break;
+  }
+
+  Serial.print("Status : ");
+
+  if (battery.imbalanceFault)
+      Serial.println("IMBALANCE DETECTED");
+  else
+      Serial.println("NORMAL");
+
+  Serial.println("===================================");
+}
+
+
+// Reusable Interface
+
+BatteryInfo getBatteryInfo()
+{
+  return battery;
 }
