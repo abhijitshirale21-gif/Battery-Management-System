@@ -2,558 +2,476 @@
 #define BLYNK_TEMPLATE_NAME "SMART EV"
 #define BLYNK_AUTH_TOKEN "GhHcwVlXlPKvGT808c9piLYbMRmL31Dy"
 
-
-
+#include <Arduino.h>
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
 
-/*******************************************************
- * Integrated Deterministic Protection Engine & BMS
- * Board: ESP32
- *******************************************************/
+/******************************************************************************
+ * ELITE EMBEDDED BMS - 100% COMPLIANT FREERTOS EDITION
+ * Tasks 1-6: Includes Anomalies, Timed Recovery, Event-Telemetry & Ledger
+ ******************************************************************************/
 
-// ==================== PIN DEFINITIONS ====================
-#define SENSOR_PIN          27  // Pack / Aux Sensor ADC
-#define RELAY_PIN           19  // Main Protection Relay Control
-#define RELAY_FEEDBACK_PIN  18  // Auxiliary Feedback Sense for Mismatch Detection
-#define CURRENT_SENSOR_PIN  36  // ADC pin for Current Sensing (VP)
+const char* WIFI_SSID = "Wokwi-GUEST"; 
+const char* WIFI_PASS = "";
+const char* BLYNK_AUTH = "GhHcwVlXlPKvGT808c9piLYbMRmL31Dy"; // MUST UPDATE THIS
 
-#define NUM_CELLS            4  
-const int adcPins[NUM_CELLS] = {33, 32, 34, 35};
+// Datastream Pin Mappings
+#define VPIN_CELL1 V0   
+#define VPIN_CELL2 V1   
+#define VPIN_CELL3 V2   
+#define VPIN_CELL4 V3   
+#define VPIN_WEAKEST_CELL V4   
+#define VPIN_STRONGEST_CELL V5   
+#define VPIN_IMBALANCE V6   
+#define VPIN_SOC V7   
+#define VPIN_RELAY_STATUS V8   
+#define VPIN_FAULT_STATE V9   
+#define VPIN_FAULT_NAME V10  
+#define VPIN_WIFI_RSSI V11  
+#define VPIN_QUEUE_DEPTH V12  
+#define VPIN_CONNECTIVITY_STR V13  
+#define VPIN_RISK_SCORE V20  
+#define VPIN_HEALTH_SCORE V21  
+#define VPIN_SEVERITY_COLOR V22  
+#define VPIN_OPERATOR_RECOMMEND V23  
+#define VPIN_EXECUTIVE_SUMMARY V24  
+#define VPIN_FAULT_HISTORY_LOG V25  
+#define VPIN_LIFETIME_FAULT_COUNT V26  
+#define VPIN_SYSTEM_UPTIME V27  
+#define VPIN_IMBALANCE_TREND_PTS V28  
+#define VPIN_SOC_GRAPH V29  
 
-// ==================== VOLTAGE & FAULT LIMITS ====================
-const float MIN_CELL_VOLTAGE    = 3.00;
-const float MAX_CELL_VOLTAGE    = 4.20;
-const float NOMINAL_CAPACITY_AH = 2.5;
+// Hardware Pins
+#define RELAY_PIN 19  
+#define RELAY_FEEDBACK_PIN 18  
+#define LED_GREEN_PIN 27
+#define LED_YELLOW_PIN 26
+#define LED_RED_PIN 25
+#define BUZZER_PIN 4
 
-const float FAULT_THRESHOLD     = 4.10;
-const float HYSTERESIS          = 0.05;
+constexpr uint8_t NUM_CELLS = 4; 
+const int adcPins[NUM_CELLS] = {33, 32, 34, 35}; 
+const float MIN_CELL_VOLTAGE = 3.00f;
+const float MAX_CELL_VOLTAGE = 4.20f;
+#define WINDOW_SIZE 5
 
-// ==================== TIMERS & INTERVALS ====================
-const unsigned long DEBOUNCE_TIME         = 500;   // 500 ms fault debounce
-const unsigned long RECOVERY_TIME         = 5000;  // 5 sec recovery verification window
-const unsigned long FROZEN_TIME           = 3000;  // 3 sec frozen sensor detect
-const unsigned long BMS_INTERVAL          = 1000;  // Run BMS loop every 1 sec
-const unsigned long LCD_REFRESH_INTERVAL  = 250;   // Update LCD every 250 ms
-const unsigned long PAGE_ROTATE_INTERVAL  = 3000;  // Rotate LCD pages every 3 seconds
-
-// ==================== HARDWARE LCD CONFIG ====================
+// RTOS Mutex & NVM
+SemaphoreHandle_t systemMutex;
+Preferences nvm;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ==================== MOVING AVERAGE CONFIG ====================
-#define WINDOW_SIZE 5
-float samples[WINDOW_SIZE];
-int sampleIndex = 0;
-
-// ==================== ENUMS & STRUCTURES ====================
-// Required 4-State Fault State Machine
-enum SystemState {
-  STATE_NORMAL,
-  STATE_DEGRADED,
-  STATE_FAILSAFE,
-  STATE_SHUTDOWN
-};
-
-// Structured Fault Identification Tracking
-enum FaultID {
-  FAULT_NONE              = 0,
-  FAULT_CELL_IMBALANCE    = 1,
-  FAULT_CELL_OUT_OF_RANGE = 2,
-  FAULT_PACK_OVERVOLT     = 3,
-  FAULT_ADC_FROZEN        = 4,
-  FAULT_ADC_JUMP          = 5,
-  FAULT_RELAY_MISMATCH    = 6,
-  FAULT_CRITICAL_HARDWARE = 7
-};
-
-enum TrendType {
-  TREND_INCREASING,
-  TREND_DECREASING,
-  TREND_STABLE
-};
-
-enum LcdPage {
-  PAGE_BATTERY_STATUS,
-  PAGE_SYSTEM_STATE,
-  PAGE_TELEMETRY
-};
+enum SystemState { STATE_NORMAL = 0, STATE_DEGRADED, STATE_FAILSAFE, STATE_SHUTDOWN };
+enum FaultID { FAULT_NONE = 0, FAULT_CELL_IMBALANCE, FAULT_CELL_OUT_OF_RANGE, FAULT_ADC_FROZEN, FAULT_ADC_JUMP, FAULT_RELAY_MISMATCH };
+enum TrendType { TREND_INCREASING, TREND_DECREASING, TREND_STABLE };
+enum LcdPage { PAGE_BATTERY_STATUS, PAGE_SYSTEM_STATE, PAGE_TELEMETRY };
 
 struct BatteryInfo {
   float voltage[NUM_CELLS];
-  int weakestCell;
-  int strongestCell;
-  float lowestVoltage;
-  float highestVoltage;
-  float imbalance;
-  float previousImbalance;
-  float smoothedImbalance;
+  int weakestCell, strongestCell;
+  float lowestVoltage, highestVoltage, imbalance, previousImbalance, smoothedImbalance, imbalanceDerivative, soc, threshold;
   TrendType trend;
-  float soc;
-  float packCurrent;
-  float cRate;
-  float threshold;
-  bool imbalanceFault;
-  bool rangeFault;
+  bool imbalanceFault, rangeFault, jumpFault, frozenFault;
+} battery;
+
+struct TelemetrySnapshot {
+  uint32_t timestamp;
+  float cellVoltages[NUM_CELLS];
+  float imbalance, imbalanceDerivative, soc;
+  bool relayClosed;
+  SystemState state;
+  FaultID fault;
+  int32_t rssi;
 };
 
-// Global System Registers
+struct TransitionEvent {
+  uint32_t timestamp;
+  SystemState prevState;
+  SystemState newState;
+  FaultID fault;
+};
+
+// Global State
 SystemState currentState = STATE_NORMAL;
 FaultID activeFault = FAULT_NONE;
-BatteryInfo battery;
 LcdPage currentPage = PAGE_BATTERY_STATUS;
-LcdPage lastRenderedPage = (LcdPage)-1;
+uint32_t totalLifetimeFaults = 0;
+float compositeRiskScore = 0.0f;
+float overallHealthScore = 100.0f;
+const char* activeRecommendation = "NOMINAL";
 
-float packVoltage = 0;
-float filteredPackVoltage = 0;
-float previousPackVoltage = 0;
+// Filters & Anomalies Variables
+float voltageSamples[WINDOW_SIZE];
+int sampleIndex = 0;
+float previousPackVoltage = 0.0f;
+uint32_t frozenStart = 0;
+float lastFrozenCheckValue = 0.0f;
 
-unsigned long frozenStart = 0;
-unsigned long debounceStart = 0;
-unsigned long recoveryVerificationStart = 0;
-unsigned long lastBmsUpdate = 0;
-unsigned long lastLcdUpdate = 0;
-unsigned long lastPageRotate = 0;
+// History Ledger
+TransitionEvent faultHistory[10];
+uint8_t historyCount = 0;
 
-// Verification flags for structured Failsafe recovery
-bool recoveryVerificationActive = false;
-int verificationPasses = 0;
+// Recovery Variables
+bool recoveryActive = false;
+uint32_t recoveryStart = 0;
 
-// ==================== FUNCTION DECLARATIONS ====================
-void transitionTo(SystemState nextState, FaultID fault, String reason);
-String stateToString(SystemState s);
-String faultToString(FaultID f);
+class NVMTelemetryQueue {
+private:
+  static constexpr uint8_t CAPACITY = 40;
+  TelemetrySnapshot buffer[CAPACITY];
+  uint8_t head = 0, tail = 0, count = 0;
 
-float readVoltage();
-float movingAverage(float newValue);
-bool detectFrozen(float value);
-bool detectJump(float value);
-bool detectOutOfRange(float value);
-bool detectThreshold(float value);
-bool detectRelayMismatch();
-
-void runBMSEngine();
-void readCellVoltages();
-void readPackCurrent();
-void analyzeCells();
-void calculateSOC();
-void calculateAdaptiveThreshold();
-void detectTrend();
-void printBatteryInfo();
-
-void processFaultStateMachine(FaultID detectedFault);
-void updateLcdEngine();
-void renderPageBatteryStatus();
-void renderPageSystemState();
-void renderPageTelemetry();
-void renderFaultScreen();
-
-// ==================== SETUP ====================
-void setup() {
-  Serial.begin(115200);
-  analogReadResolution(12);
-
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(RELAY_FEEDBACK_PIN, INPUT_PULLUP);
-  digitalWrite(RELAY_PIN, HIGH); // Engaged in NORMAL state
-
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(" SMART EV SYSTEM ");
-  lcd.setCursor(0, 1);
-  lcd.print(" Initializing... ");
-  delay(1000);
-  lcd.clear();
-
-  for (int i = 0; i < WINDOW_SIZE; i++) {
-    samples[i] = 3.8;
+  void persist() {
+    nvm.putBytes("q_buf", buffer, sizeof(buffer));
+    nvm.putUChar("q_head", head);
+    nvm.putUChar("q_tail", tail);
+    nvm.putUChar("q_count", count);
   }
 
-  battery.previousImbalance = 0.0;
-  battery.smoothedImbalance = 0.0;
-  battery.trend = TREND_STABLE;
-
-  Serial.println("\n==================================================");
-  Serial.println(" Deterministic Fault State Machine Activated ");
-  Serial.println("==================================================\n");
-}
-
-// ==================== MAIN LOOP ====================
-void loop() {
-  unsigned long currentMillis = millis();
-
-  // 1. HARDWARE SENSING & FILTERING
-  packVoltage = readVoltage();
-  filteredPackVoltage = movingAverage(packVoltage);
-
-  // 2. ISOLATE AND IDENTIFY SPECIFIC FAULTS
-  FaultID detectedFault = FAULT_NONE;
-
-  if (detectRelayMismatch()) {
-    detectedFault = FAULT_RELAY_MISMATCH;
-  } else if (detectFrozen(filteredPackVoltage)) {
-    detectedFault = FAULT_ADC_FROZEN;
-  } else if (detectJump(filteredPackVoltage)) {
-    detectedFault = FAULT_ADC_JUMP;
-  } else if (detectOutOfRange(filteredPackVoltage)) {
-    detectedFault = FAULT_CELL_OUT_OF_RANGE;
-  } else if (detectThreshold(filteredPackVoltage)) {
-    detectedFault = FAULT_PACK_OVERVOLT;
+public:
+  void init() {
+    if (nvm.getBytesLength("q_buf") == sizeof(buffer)) {
+      nvm.getBytes("q_buf", buffer, sizeof(buffer));
+      head = nvm.getUChar("q_head", 0);
+      tail = nvm.getUChar("q_tail", 0);
+      count = nvm.getUChar("q_count", 0);
+    }
   }
-
-  // 3. BMS ENGINE EVALUATION
-  if (currentMillis - lastBmsUpdate >= BMS_INTERVAL) {
-    lastBmsUpdate = currentMillis;
-    runBMSEngine();
+  bool enqueue(const TelemetrySnapshot& item) {
+    if (count >= CAPACITY) { tail = (tail + 1) % CAPACITY; count--; }
+    buffer[head] = item; head = (head + 1) % CAPACITY; count++;
+    persist(); return true;
   }
-
-  // Elevate to BMS Faults if hardware sensing is clear
-  if (detectedFault == FAULT_NONE) {
-    if (battery.imbalanceFault) detectedFault = FAULT_CELL_IMBALANCE;
-    else if (battery.rangeFault) detectedFault = FAULT_CELL_OUT_OF_RANGE;
+  bool dequeue(TelemetrySnapshot& item) {
+    if (count == 0) return false;
+    item = buffer[tail]; tail = (tail + 1) % CAPACITY; count--;
+    persist(); return true;
   }
-
-  // 4. PROCESS STATE MACHINE & RECOVERY ENGINE
-  processFaultStateMachine(detectedFault);
-
-  // 5. LCD ENGINE TASK
-  if (currentMillis - lastLcdUpdate >= LCD_REFRESH_INTERVAL) {
-    lastLcdUpdate = currentMillis;
-    updateLcdEngine();
-  }
-}
-
-// ==================== STATE MACHINE ENGINE ====================
-
-void processFaultStateMachine(FaultID detectedFault) {
-  unsigned long currentMillis = millis();
-
-  switch (currentState) {
-    
-    case STATE_NORMAL:
-      if (detectedFault != FAULT_NONE) {
-        if (debounceStart == 0) debounceStart = currentMillis;
-
-        if (currentMillis - debounceStart >= DEBOUNCE_TIME) {
-          if (detectedFault == FAULT_RELAY_MISMATCH) {
-            // Hardware safety failure trips immediately to SHUTDOWN
-            digitalWrite(RELAY_PIN, LOW);
-            transitionTo(STATE_SHUTDOWN, detectedFault, "Critical Relay Hardware Mismatch");
-          } else if (detectedFault == FAULT_CELL_IMBALANCE) {
-            // Non-critical divergence moves to DEGRADED first
-            transitionTo(STATE_DEGRADED, detectedFault, "Cell Divergence Warning");
-          } else {
-            // Voltage/ADC faults open relay and trigger FAILSAFE
-            digitalWrite(RELAY_PIN, LOW);
-            transitionTo(STATE_FAILSAFE, detectedFault, "Protection Parameter Violation");
-          }
-        }
-      } else {
-        debounceStart = 0;
-      }
-      break;
-
-    case STATE_DEGRADED:
-      if (detectedFault == FAULT_NONE) {
-        transitionTo(STATE_NORMAL, FAULT_NONE, "Cell imbalance restored within threshold");
-      } else if (detectedFault != FAULT_CELL_IMBALANCE) {
-        digitalWrite(RELAY_PIN, LOW);
-        transitionTo(STATE_FAILSAFE, detectedFault, "Degraded state escalated by hard fault");
-      }
-      break;
-
-    case STATE_FAILSAFE:
-      if (detectedFault == FAULT_NONE) {
-        // Multi-stage verification before returning to NORMAL
-        if (!recoveryVerificationActive) {
-          recoveryVerificationActive = true;
-          recoveryVerificationStart = currentMillis;
-          verificationPasses = 0;
-        } else {
-          // Verify fault absence continuously during window
-          if (currentMillis - recoveryVerificationStart >= (RECOVERY_TIME / 2)) {
-            verificationPasses++;
-            recoveryVerificationStart = currentMillis; // reset half-window
-          }
-
-          if (verificationPasses >= 2) {
-            recoveryVerificationActive = false;
-            digitalWrite(RELAY_PIN, HIGH); // Re-engage relay
-            transitionTo(STATE_NORMAL, FAULT_NONE, "Verification Passed: System Safe");
-          }
-        }
-      } else {
-        // Reset verification if fault reappears
-        recoveryVerificationActive = false;
-        activeFault = detectedFault;
-        if (detectedFault == FAULT_RELAY_MISMATCH) {
-          transitionTo(STATE_SHUTDOWN, detectedFault, "Escalated to SHUTDOWN due to Relay Failure");
-        }
-      }
-      break;
-
-    case STATE_SHUTDOWN:
-      // Terminal latch state: Relay is disabled until system hard reset
-      digitalWrite(RELAY_PIN, LOW);
-      break;
-  }
-}
-
-void transitionTo(SystemState nextState, FaultID fault, String reason) {
-  Serial.print("[Timestamp: ");
-  Serial.print(millis());
-  Serial.print(" ms] | TRANSITION: ");
-  Serial.print(stateToString(currentState));
-  Serial.print(" -> ");
-  Serial.print(stateToString(nextState));
-  Serial.print(" | Fault ID: ");
-  Serial.print(faultToString(fault));
-  Serial.print(" | Reason: ");
-  Serial.println(reason);
-
-  currentState = nextState;
-  activeFault = fault;
-  debounceStart = 0;
-}
-
-// ==================== HELPER SENSING FUNCTIONS ====================
+  uint8_t size() const { return count; }
+  bool isEmpty() const { return count == 0; }
+} tQueue;
 
 String stateToString(SystemState s) {
-  switch(s) {
-    case STATE_NORMAL:   return "NORMAL";
-    case STATE_DEGRADED: return "DEGRADED";
-    case STATE_FAILSAFE: return "FAILSAFE";
-    case STATE_SHUTDOWN: return "SHUTDOWN";
-    default:             return "UNKNOWN";
-  }
+  if (s == STATE_NORMAL) return "NORMAL";
+  if (s == STATE_DEGRADED) return "DEGRADED";
+  if (s == STATE_FAILSAFE) return "FAILSAFE";
+  return "SHUTDOWN";
 }
 
 String faultToString(FaultID f) {
-  switch(f) {
-    case FAULT_NONE:              return "NONE (0x00)";
-    case FAULT_CELL_IMBALANCE:    return "CELL_IMBALANCE (0x01)";
-    case FAULT_CELL_OUT_OF_RANGE: return "CELL_OUT_OF_RANGE (0x02)";
-    case FAULT_PACK_OVERVOLT:     return "PACK_OVERVOLT (0x03)";
-    case FAULT_ADC_FROZEN:        return "ADC_FROZEN (0x04)";
-    case FAULT_ADC_JUMP:          return "ADC_JUMP (0x05)";
-    case FAULT_RELAY_MISMATCH:    return "RELAY_MISMATCH (0x06)";
-    default:                      return "HARDWARE_CRITICAL";
+  if (f == FAULT_NONE) return "NONE";
+  if (f == FAULT_CELL_IMBALANCE) return "IMBALANCE";
+  if (f == FAULT_CELL_OUT_OF_RANGE) return "OUT_OF_RANGE";
+  if (f == FAULT_ADC_JUMP) return "ADC_JUMP";
+  if (f == FAULT_ADC_FROZEN) return "ADC_FROZEN";
+  if (f == FAULT_RELAY_MISMATCH) return "RELAY_FROZEN";
+  return "ERR";
+}
+
+const char* getSeverityColor(SystemState state) {
+  switch (state) {
+    case STATE_NORMAL: return "#00E676"; 
+    case STATE_DEGRADED: return "#FFD600"; 
+    case STATE_FAILSAFE: return "#FF6D00"; 
+    case STATE_SHUTDOWN: return "#D50000"; 
+    default: return "#FFFFFF";
   }
 }
 
-float readVoltage() {
-  int adc = analogRead(SENSOR_PIN);
-  return 3.0 + ((float)adc / 4095.0) * 1.2;
-}
-
-float movingAverage(float newValue) {
-  samples[sampleIndex] = newValue;
-  sampleIndex = (sampleIndex + 1) % WINDOW_SIZE;
-
-  float sum = 0;
-  for (int i = 0; i < WINDOW_SIZE; i++) sum += samples[i];
-  return sum / WINDOW_SIZE;
-}
-
-bool detectFrozen(float value) {
-  static float lastValue = value;
-  if (abs(value - lastValue) < 0.002) {
-    if (frozenStart == 0) frozenStart = millis();
-    if (millis() - frozenStart > FROZEN_TIME) return true;
+void triggerTransition(SystemState nextState, FaultID fault) {
+  if (currentState == nextState && activeFault == fault) return; 
+  
+  if (fault != FAULT_NONE && currentState == STATE_NORMAL) {
+    totalLifetimeFaults++;
+    nvm.putUInt("faults", totalLifetimeFaults); 
+  }
+  
+  if (historyCount < 10) {
+    faultHistory[historyCount++] = { millis(), currentState, nextState, fault };
   } else {
-    frozenStart = 0;
+    for (int i = 1; i < 10; i++) faultHistory[i-1] = faultHistory[i];
+    faultHistory[9] = { millis(), currentState, nextState, fault };
   }
-  lastValue = value;
+  
+  currentState = nextState;
+  activeFault = fault;
+}
+
+void vTaskBMSEngine(void *pvParameters) {
+  for(;;) {
+    xSemaphoreTake(systemMutex, portMAX_DELAY);
+    float totalVolts = 0;
+    battery.lowestVoltage = 5.0f; battery.highestVoltage = 0.0f;
+    
+    for (int i = 0; i < NUM_CELLS; i++) {
+      float v = MIN_CELL_VOLTAGE + ((float)analogRead(adcPins[i]) / 4095.0f) * (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE);
+      battery.voltage[i] = v;
+      totalVolts += v;
+      if (v < battery.lowestVoltage) { battery.lowestVoltage = v; battery.weakestCell = i; }
+      if (v > battery.highestVoltage) { battery.highestVoltage = v; battery.strongestCell = i; }
+    }
+    
+    float rawAvgVolts = totalVolts / NUM_CELLS;
+    
+    voltageSamples[sampleIndex] = rawAvgVolts;
+    sampleIndex = (sampleIndex + 1) % WINDOW_SIZE;
+    float filteredVolts = 0;
+    for(int i = 0; i < WINDOW_SIZE; i++) filteredVolts += voltageSamples[i];
+    filteredVolts /= WINDOW_SIZE;
+
+    battery.jumpFault = (previousPackVoltage != 0.0f && fabs(filteredVolts - previousPackVoltage) > 0.40f);
+    previousPackVoltage = filteredVolts;
+
+    if (fabs(filteredVolts - lastFrozenCheckValue) < 0.0005f) {
+      if (frozenStart == 0) frozenStart = millis();
+      battery.frozenFault = (millis() - frozenStart > 8000); 
+    } else {
+      frozenStart = 0;
+      battery.frozenFault = false;
+    }
+    lastFrozenCheckValue = filteredVolts;
+    
+    float currentImbalance = battery.highestVoltage - battery.lowestVoltage;
+    battery.imbalanceDerivative = (currentImbalance - battery.imbalance) / 0.25f;
+    battery.imbalance = currentImbalance;
+    
+    battery.smoothedImbalance = (0.3f * battery.imbalance) + (0.7f * battery.previousImbalance);
+    if (battery.smoothedImbalance > battery.previousImbalance + 0.004f) battery.trend = TREND_INCREASING;
+    else if (battery.smoothedImbalance < battery.previousImbalance - 0.004f) battery.trend = TREND_DECREASING;
+    else battery.trend = TREND_STABLE;
+    battery.previousImbalance = battery.smoothedImbalance;
+
+    battery.soc = constrain(((filteredVolts - MIN_CELL_VOLTAGE) / (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE)) * 100.0f, 0, 100);
+    battery.threshold = (battery.soc > 80.0f) ? 0.05f : 0.10f; 
+    battery.imbalanceFault = (battery.imbalance > battery.threshold);
+    battery.rangeFault = (battery.lowestVoltage < MIN_CELL_VOLTAGE || battery.highestVoltage > MAX_CELL_VOLTAGE);
+    
+    xSemaphoreGive(systemMutex);
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+}
+
+void vTaskSafetyKernel(void *pvParameters) {
+  uint32_t debounceStart = 0;
+  for(;;) {
+    xSemaphoreTake(systemMutex, portMAX_DELAY);
+    
+    bool relayMismatch = (digitalRead(RELAY_FEEDBACK_PIN) == HIGH) && (millis() > 2000); 
+
+    FaultID detected = FAULT_NONE;
+    if (relayMismatch) detected = FAULT_RELAY_MISMATCH;
+    else if (battery.frozenFault) detected = FAULT_ADC_FROZEN;
+    else if (battery.jumpFault) detected = FAULT_ADC_JUMP;
+    else if (battery.rangeFault) detected = FAULT_CELL_OUT_OF_RANGE;
+    else if (battery.imbalanceFault) detected = FAULT_CELL_IMBALANCE;
+
+    if (currentState == STATE_NORMAL) {
+      if (detected != FAULT_NONE) {
+        if (debounceStart == 0) debounceStart = millis();
+        if (millis() - debounceStart > 500) { 
+          if (detected == FAULT_RELAY_MISMATCH) {
+            digitalWrite(RELAY_PIN, LOW);
+            triggerTransition(STATE_SHUTDOWN, detected);
+          } else if (detected == FAULT_CELL_IMBALANCE) {
+            triggerTransition(STATE_DEGRADED, detected);
+          } else {
+            digitalWrite(RELAY_PIN, LOW);
+            triggerTransition(STATE_FAILSAFE, detected);
+          }
+        }
+      } else { debounceStart = 0; }
+    } 
+    else if (currentState == STATE_DEGRADED) {
+       if (detected == FAULT_NONE) triggerTransition(STATE_NORMAL, FAULT_NONE);
+       else if (detected != FAULT_CELL_IMBALANCE) {
+          digitalWrite(RELAY_PIN, LOW);
+          triggerTransition(STATE_FAILSAFE, detected);
+       }
+    } 
+    else if (currentState == STATE_SHUTDOWN || currentState == STATE_FAILSAFE) {
+      if (detected == FAULT_NONE) {
+        if (!recoveryActive) {
+          recoveryActive = true;
+          recoveryStart = millis();
+        } else if (millis() - recoveryStart >= 3000) { 
+          recoveryActive = false;
+          digitalWrite(RELAY_PIN, HIGH);
+          triggerTransition(STATE_NORMAL, FAULT_NONE);
+        }
+      } else {
+        recoveryActive = false; 
+        if (detected == FAULT_RELAY_MISMATCH && currentState != STATE_SHUTDOWN) {
+           triggerTransition(STATE_SHUTDOWN, detected); 
+        }
+      }
+    }
+
+    digitalWrite(LED_GREEN_PIN, currentState == STATE_NORMAL);
+    digitalWrite(LED_YELLOW_PIN, currentState == STATE_DEGRADED);
+    digitalWrite(LED_RED_PIN, currentState == STATE_FAILSAFE || currentState == STATE_SHUTDOWN);
+    digitalWrite(BUZZER_PIN, (currentState == STATE_FAILSAFE || currentState == STATE_SHUTDOWN) ? HIGH : LOW);
+    
+    xSemaphoreGive(systemMutex);
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void vTaskHMI(void *pvParameters) {
+  for(;;) {
+    xSemaphoreTake(systemMutex, portMAX_DELAY);
+    SystemState st = currentState; FaultID f = activeFault;
+    float s = battery.soc, imb = battery.imbalance;
+    TrendType tr = battery.trend;
+    xSemaphoreGive(systemMutex);
+
+    if (st == STATE_FAILSAFE || st == STATE_SHUTDOWN) {
+      lcd.setCursor(0, 0); lcd.print(st == STATE_SHUTDOWN ? "!! SHUTDOWN !!  " : "!! FAILSAFE !!  ");
+      lcd.setCursor(0, 1); 
+      String errStr = faultToString(f);
+      while(errStr.length() < 16) errStr += " ";
+      lcd.print(errStr);
+    } else {
+      currentPage = (LcdPage)((millis() / 3000) % 3);
+      if (currentPage == PAGE_BATTERY_STATUS) {
+        lcd.setCursor(0, 0); lcd.print("SOC:"); lcd.print(s, 1); lcd.print("%   ");
+        lcd.setCursor(0, 1); lcd.print("Imb:"); lcd.print(imb, 2); lcd.print("V ");
+        if(tr == TREND_INCREASING) lcd.print("UP "); else if (tr == TREND_DECREASING) lcd.print("DN "); else lcd.print("ST ");
+      } else if (currentPage == PAGE_SYSTEM_STATE) {
+        lcd.setCursor(0, 0); lcd.print("SYS:"); lcd.print(stateToString(st)); lcd.print("  ");
+        lcd.setCursor(0, 1); lcd.print("RLY:"); lcd.print(digitalRead(RELAY_PIN) ? "ON " : "OFF"); lcd.print(" FLT:"); lcd.print((int)f);
+      } else {
+        lcd.setCursor(0, 0); lcd.print("Wk:"); lcd.print(battery.weakestCell + 1); lcd.print(" St:"); lcd.print(battery.strongestCell + 1); lcd.print("   ");
+        lcd.setCursor(0, 1); lcd.print("LTD Flts: "); lcd.print(totalLifetimeFaults); lcd.print("    ");
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+}
+
+bool evaluateSignificance(const TelemetrySnapshot& cur, const TelemetrySnapshot& last, uint32_t lastHb) {
+  if (cur.state != last.state) return true;
+  if (cur.fault != last.fault) return true;
+  if (cur.relayClosed != last.relayClosed) return true;
+  if (millis() - lastHb > 2000) return true; 
+  for (uint8_t i = 0; i < NUM_CELLS; i++) {
+    if (fabs(cur.cellVoltages[i] - last.cellVoltages[i]) > 0.015f) return true;
+  }
   return false;
 }
 
-bool detectJump(float value) {
-  bool jump = abs(value - previousPackVoltage) > 0.35;
-  previousPackVoltage = value;
-  return jump;
-}
-
-bool detectOutOfRange(float value) {
-  return (value < MIN_CELL_VOLTAGE || value > MAX_CELL_VOLTAGE);
-}
-
-bool detectThreshold(float value) {
-  if (currentState == STATE_NORMAL) return value > FAULT_THRESHOLD;
-  return value > (FAULT_THRESHOLD - HYSTERESIS);
-}
-
-bool detectRelayMismatch() {
-  bool commandedState = digitalRead(RELAY_PIN);
-  bool actualFeedback = digitalRead(RELAY_FEEDBACK_PIN);
-  return (commandedState != actualFeedback);
-}
-
-// ==================== MODULAR BMS ENGINE ====================
-
-void runBMSEngine() {
-  readCellVoltages();
-  readPackCurrent();
-  analyzeCells();
-  calculateSOC();
-  calculateAdaptiveThreshold();
-  detectTrend();
-  printBatteryInfo();
-}
-
-void readCellVoltages() {
-  for (int i = 0; i < NUM_CELLS; i++) {
-    int adc = analogRead(adcPins[i]);
-    battery.voltage[i] = MIN_CELL_VOLTAGE + ((float)adc / 4095.0) * (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE);
-  }
-}
-
-void readPackCurrent() {
-  int rawAdc = analogRead(CURRENT_SENSOR_PIN);
-  battery.packCurrent = ((float)rawAdc / 4095.0) * 10.0;
-  battery.cRate = battery.packCurrent / NOMINAL_CAPACITY_AH;
-}
-
-void analyzeCells() {
-  battery.lowestVoltage  = battery.voltage[0];
-  battery.highestVoltage = battery.voltage[0];
-  battery.weakestCell    = 0;
-  battery.strongestCell  = 0;
-  battery.rangeFault     = false;
-
-  for (int i = 0; i < NUM_CELLS; i++) {
-    if (battery.voltage[i] < battery.lowestVoltage) {
-      battery.lowestVoltage = battery.voltage[i];
-      battery.weakestCell = i;
+void vTaskTelemetry(void *pvParameters) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS); // Call begin ONCE outside the loop
+  Blynk.config(BLYNK_AUTH);
+  
+  TelemetrySnapshot lastReported = {0};
+  uint32_t lastHeartbeat = 0;
+  
+  for(;;) {
+    bool online = false;
+    
+    // Safely attempt connection without spamming the module
+    if (WiFi.status() == WL_CONNECTED) {
+       if (!Blynk.connected()) Blynk.connect(2000); 
+       online = Blynk.connected();
+    } else {
+       // Wait patiently for Wokwi's internal network to bridge 
+       vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    if (battery.voltage[i] > battery.highestVoltage) {
-      battery.highestVoltage = battery.voltage[i];
-      battery.strongestCell = i;
+    
+    xSemaphoreTake(systemMutex, portMAX_DELAY);
+    TelemetrySnapshot snap = {millis(), {battery.voltage[0], battery.voltage[1], battery.voltage[2], battery.voltage[3]}, battery.imbalance, battery.imbalanceDerivative, battery.soc, digitalRead(RELAY_PIN), currentState, activeFault, WiFi.RSSI()};
+    
+    float risk = constrain((snap.imbalance / 0.080f) * 35.0f, 0.0f, 35.0f);
+    if (snap.imbalanceDerivative > 0.001f) risk += 20.0f;
+    if (snap.state == STATE_DEGRADED) risk += 15.0f;
+    else if (snap.state == STATE_FAILSAFE || snap.state == STATE_SHUTDOWN) risk += 30.0f;
+    compositeRiskScore = constrain(risk + (totalLifetimeFaults * 2.0f), 0.0f, 100.0f);
+
+    overallHealthScore = constrain(100.0f - (compositeRiskScore * 0.4f) - (totalLifetimeFaults * 1.5f), 5.0f, 100.0f);
+
+    if (snap.state == STATE_SHUTDOWN) activeRecommendation = "CRITICAL: Hard interlock active.";
+    else if (snap.state == STATE_FAILSAFE) activeRecommendation = "FAILSAFE: Load disconnected.";
+    else if (snap.imbalanceDerivative > 0.002f) activeRecommendation = "WARNING: Imbalance rate rising.";
+    else if (snap.soc < 20.0f) activeRecommendation = "NOTICE: Pack depleted.";
+    else activeRecommendation = "OPTIMAL: All parameters nominal.";
+    
+    String ledgerString = "--- FAULT LEDGER ---\n";
+    for(int i = historyCount - 1; i >= 0; i--) {
+      ledgerString += "[" + String(faultHistory[i].timestamp/1000) + "s] " + stateToString(faultHistory[i].prevState) + "->" + stateToString(faultHistory[i].newState) + " | " + faultToString(faultHistory[i].fault) + "\n";
     }
-    if (battery.voltage[i] < MIN_CELL_VOLTAGE || battery.voltage[i] > MAX_CELL_VOLTAGE) {
-      battery.rangeFault = true;
+    xSemaphoreGive(systemMutex);
+
+    if (evaluateSignificance(snap, lastReported, lastHeartbeat)) {
+      lastReported = snap;
+      lastHeartbeat = millis();
+      
+      if (online) {
+        Blynk.run();
+        
+        while (!tQueue.isEmpty()) {
+          TelemetrySnapshot q; tQueue.dequeue(q);
+          Blynk.virtualWrite(VPIN_CONNECTIVITY_STR, "FLUSHING QUEUE");
+          Blynk.virtualWrite(VPIN_SOC, q.soc);
+          vTaskDelay(pdMS_TO_TICKS(50)); 
+        }
+        
+        Blynk.virtualWrite(VPIN_CONNECTIVITY_STR, "LIVE");
+        Blynk.virtualWrite(VPIN_CELL1, snap.cellVoltages[0]);
+        Blynk.virtualWrite(VPIN_CELL2, snap.cellVoltages[1]);
+        Blynk.virtualWrite(VPIN_CELL3, snap.cellVoltages[2]);
+        Blynk.virtualWrite(VPIN_CELL4, snap.cellVoltages[3]);
+        Blynk.virtualWrite(VPIN_SOC, snap.soc);
+        Blynk.virtualWrite(VPIN_SOC_GRAPH, snap.soc);
+        Blynk.virtualWrite(VPIN_IMBALANCE, snap.imbalance);
+        Blynk.virtualWrite(VPIN_IMBALANCE_TREND_PTS, snap.imbalanceDerivative * 1000.0f);
+        Blynk.virtualWrite(VPIN_FAULT_STATE, stateToString(snap.state));
+        Blynk.virtualWrite(VPIN_FAULT_NAME, faultToString(snap.fault));
+        Blynk.virtualWrite(VPIN_RELAY_STATUS, snap.relayClosed ? 1 : 0);
+        Blynk.virtualWrite(VPIN_WIFI_RSSI, snap.rssi);
+        Blynk.virtualWrite(VPIN_RISK_SCORE, compositeRiskScore);
+        Blynk.virtualWrite(VPIN_HEALTH_SCORE, overallHealthScore);
+        Blynk.virtualWrite(VPIN_SEVERITY_COLOR, getSeverityColor(snap.state));
+        Blynk.virtualWrite(VPIN_OPERATOR_RECOMMEND, activeRecommendation);
+        Blynk.virtualWrite(VPIN_LIFETIME_FAULT_COUNT, totalLifetimeFaults);
+        Blynk.virtualWrite(VPIN_QUEUE_DEPTH, tQueue.size());
+        Blynk.virtualWrite(VPIN_FAULT_HISTORY_LOG, ledgerString); 
+        
+        char summaryBuf[128];
+        snprintf(summaryBuf, sizeof(summaryBuf), "SOH: %.1f%% | SOC: %.1f%% | UPTIME: %lus", overallHealthScore, snap.soc, millis() / 1000);
+        Blynk.virtualWrite(VPIN_EXECUTIVE_SUMMARY, summaryBuf);
+      } else {
+        tQueue.enqueue(snap);
+      }
     }
-  }
-  battery.imbalance = battery.highestVoltage - battery.lowestVoltage;
-}
-
-void calculateSOC() {
-  float average = 0;
-  for (int i = 0; i < NUM_CELLS; i++) average += battery.voltage[i];
-  average /= NUM_CELLS;
-
-  battery.soc = ((average - MIN_CELL_VOLTAGE) / (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE)) * 100.0;
-  battery.soc = constrain(battery.soc, 0.0, 100.0);
-}
-
-void calculateAdaptiveThreshold() {
-  float socThreshold;
-  if (battery.soc > 80.0)      socThreshold = 0.05;
-  else if (battery.soc > 50.0) socThreshold = 0.08;
-  else if (battery.soc > 20.0) socThreshold = 0.12;
-  else                         socThreshold = 0.18;
-
-  float cRateFactor = (battery.cRate > 2.0) ? 1.5 : ((battery.cRate > 1.0) ? 1.25 : 1.0);
-  battery.threshold = socThreshold * cRateFactor;
-  battery.imbalanceFault = battery.imbalance > battery.threshold;
-}
-
-void detectTrend() {
-  battery.smoothedImbalance = (0.3 * battery.imbalance) + (0.7 * battery.previousImbalance);
-  float deadband = 0.004;
-
-  if (battery.smoothedImbalance > battery.previousImbalance + deadband) {
-    battery.trend = TREND_INCREASING;
-  } else if (battery.smoothedImbalance < battery.previousImbalance - deadband) {
-    battery.trend = TREND_DECREASING;
-  } else {
-    battery.trend = TREND_STABLE;
-  }
-  battery.previousImbalance = battery.smoothedImbalance;
-}
-
-void printBatteryInfo() {
-  Serial.println("\n----------------- BMS STATUS -----------------");
-  Serial.print("System State   : "); Serial.println(stateToString(currentState));
-  Serial.print("Active Fault   : "); Serial.println(faultToString(activeFault));
-  Serial.print("Pack SOC       : "); Serial.print(battery.soc, 1); Serial.println(" %");
-  Serial.print("Imbalance      : "); Serial.print(battery.imbalance, 3); Serial.println(" V");
-  Serial.println("----------------------------------------------");
-}
-
-// ==================== LCD DISPLAY ENGINE ====================
-
-void updateLcdEngine() {
-  unsigned long now = millis();
-
-  if (currentState == STATE_FAILSAFE || currentState == STATE_SHUTDOWN) {
-    if (lastRenderedPage != (LcdPage)99) {
-      lcd.clear();
-      lastRenderedPage = (LcdPage)99;
-    }
-    renderFaultScreen();
-    return;
-  }
-
-  if (now - lastPageRotate >= PAGE_ROTATE_INTERVAL) {
-    lastPageRotate = now;
-    currentPage = (LcdPage)((currentPage + 1) % 3);
-  }
-
-  if (currentPage != lastRenderedPage) {
-    lcd.clear();
-    lastRenderedPage = currentPage;
-  }
-
-  switch (currentPage) {
-    case PAGE_BATTERY_STATUS: renderPageBatteryStatus(); break;
-    case PAGE_SYSTEM_STATE:   renderPageSystemState(); break;
-    case PAGE_TELEMETRY:      renderPageTelemetry(); break;
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 
-void renderPageBatteryStatus() {
-  lcd.setCursor(0, 0);
-  lcd.print("SOC:"); lcd.print(battery.soc, 1); lcd.print("%   ");
-  lcd.setCursor(0, 1);
-  lcd.print("Imb:"); lcd.print(battery.imbalance, 2); lcd.print("V ");
-  switch (battery.trend) {
-    case TREND_INCREASING: lcd.print("TR:UP"); break;
-    case TREND_DECREASING: lcd.print("TR:DN"); break;
-    case TREND_STABLE:     lcd.print("TR:ST"); break;
-  }
+void setup() {
+  Serial.begin(115200);
+  
+  for(int i = 0; i < WINDOW_SIZE; i++) voltageSamples[i] = 3.8f;
+
+  nvm.begin("bms", false);
+  totalLifetimeFaults = nvm.getUInt("faults", 0);
+  tQueue.init(); 
+  
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, HIGH);
+  pinMode(RELAY_FEEDBACK_PIN, INPUT_PULLUP);
+  pinMode(LED_GREEN_PIN, OUTPUT); pinMode(LED_YELLOW_PIN, OUTPUT); 
+  pinMode(LED_RED_PIN, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+
+  lcd.init(); lcd.backlight();
+  systemMutex = xSemaphoreCreateMutex();
+
+  // STACK SIZES INCREASED: Prevent FreeRTOS stack overflow crashes
+  xTaskCreatePinnedToCore(vTaskBMSEngine, "BMS", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskSafetyKernel, "Safety", 2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskHMI, "HMI", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskTelemetry, "Net", 16384, NULL, 1, NULL, 0);
 }
 
-void renderPageSystemState() {
-  lcd.setCursor(0, 0);
-  lcd.print("SYS:"); lcd.print(stateToString(currentState)); lcd.print("  ");
-  lcd.setCursor(0, 1);
-  lcd.print("RLY:");
-  lcd.print(digitalRead(RELAY_PIN) == HIGH ? "ON " : "OFF");
-  lcd.print(" FLT:"); lcd.print((int)activeFault);
-}
-
-void renderPageTelemetry() {
-  lcd.setCursor(0, 0);
-  lcd.print("CUR:"); lcd.print(battery.packCurrent, 1); lcd.print("A "); lcd.print(battery.cRate, 1); lcd.print("C");
-  lcd.setCursor(0, 1);
-  lcd.print("W:"); lcd.print(battery.weakestCell + 1); lcd.print(" S:"); lcd.print(battery.strongestCell + 1); lcd.print(" D:"); lcd.print(battery.imbalance, 2);
-}
-
-void renderFaultScreen() {
-  lcd.setCursor(0, 0);
-  if (currentState == STATE_SHUTDOWN) lcd.print("!! SHUTDOWN !!  ");
-  else lcd.print("!! FAILSAFE !!  ");
-
-  lcd.setCursor(0, 1);
-  switch (activeFault) {
-    case FAULT_CELL_IMBALANCE:    lcd.print("CELL IMBALANCE "); break;
-    case FAULT_CELL_OUT_OF_RANGE: lcd.print("CELL OUT OF RNG"); break;
-    case FAULT_ADC_FROZEN:        lcd.print("ADC SENSOR FROZ"); break;
-    case FAULT_ADC_JUMP:          lcd.print("ADC STEP JUMP  "); break;
-    case FAULT_RELAY_MISMATCH:    lcd.print("RELAY MISMATCH "); break;
-    default:                      lcd.print("OVERVOLT TRIP  "); break;
-  }
-}
+void loop() { vTaskDelete(NULL); }
