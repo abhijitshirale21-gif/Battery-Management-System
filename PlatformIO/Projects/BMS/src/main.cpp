@@ -206,15 +206,7 @@ void vTaskBMSEngine(void *pvParameters) {
     battery.lowestVoltage = 5.0f; battery.highestVoltage = 0.0f;
     
     for (int i = 0; i < NUM_CELLS; i++) {
-      // [FIX] Read the pin and add a random fluctuation between -2 and +2 to simulate noise
-      int noisyRead = analogRead(adcPins[i]) + random(-2, 3);
-      
-      // [FIX] Constrain it so the noise doesn't push it outside the 12-bit 0-4095 range
-      noisyRead = constrain(noisyRead, 0, 4095); 
-
-      // [FIX] Calculate the voltage using the noisy reading instead of the static analogRead
-      float v = MIN_CELL_VOLTAGE + ((float)noisyRead / 4095.0f) * (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE);
-      
+      float v = MIN_CELL_VOLTAGE + ((float)analogRead(adcPins[i]) / 4095.0f) * (MAX_CELL_VOLTAGE - MIN_CELL_VOLTAGE);
       battery.voltage[i] = v;
       totalVolts += v;
       if (v < battery.lowestVoltage) { battery.lowestVoltage = v; battery.weakestCell = i; }
@@ -232,16 +224,14 @@ void vTaskBMSEngine(void *pvParameters) {
     battery.jumpFault = (previousPackVoltage != 0.0f && fabs(filteredVolts - previousPackVoltage) > 0.40f);
     previousPackVoltage = filteredVolts;
 
-    // FIX: Check raw totalVolts instead of heavily averaged filteredVolts.
-    // 1 ADC step is ~0.00029V, so a threshold of 0.0001f ensures ANY raw noise resets the timer.
-    if (fabs(totalVolts - lastFrozenCheckValue) < 0.0001f) {
+    if (fabs(filteredVolts - lastFrozenCheckValue) < 0.0005f) {
       if (frozenStart == 0) frozenStart = millis();
       battery.frozenFault = (millis() - frozenStart > 8000); 
     } else {
       frozenStart = 0;
       battery.frozenFault = false;
     }
-    lastFrozenCheckValue = totalVolts;
+    lastFrozenCheckValue = filteredVolts;
     
     float currentImbalance = battery.highestVoltage - battery.lowestVoltage;
     battery.imbalanceDerivative = (currentImbalance - battery.imbalance) / 0.25f;
