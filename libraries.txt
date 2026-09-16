@@ -6,4 +6,3 @@
 Blynk
 LiquidCrystal I2C
 OneWire
-ArdRTOS
