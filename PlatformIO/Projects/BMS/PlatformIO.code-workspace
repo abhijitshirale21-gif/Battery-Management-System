@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "BMS",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
